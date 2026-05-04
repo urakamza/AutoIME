@@ -12,6 +12,7 @@
 
 #pragma comment(lib, "Imm32.lib")
 #pragma comment(lib, "Comctl32.lib")
+#pragma comment(lib, "Advapi32.lib")
 
 #ifndef IMC_SETOPENSTATUS
 #define IMC_SETOPENSTATUS 0x0006
@@ -24,6 +25,7 @@
 
 #define WM_TRAYICON         (WM_USER + 1)
 #define TRAYICON_ID         1
+#define TIMER_DBLCLK        2001
 
 // 트레이 메뉴 커맨드
 #define ID_TOGGLE_IME       1001
@@ -860,8 +862,40 @@ void ShowTrayMenu(HWND hwnd)
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
-    if (msg == WM_TRAYICON && lParam == WM_RBUTTONUP)
-        ShowTrayMenu(hwnd);
+    static int clickCount = 0;
+
+    if (msg == WM_TRAYICON)
+    {
+        if (lParam == WM_RBUTTONUP)
+        {
+            clickCount = 0;
+            KillTimer(hwnd, TIMER_DBLCLK);
+            ShowTrayMenu(hwnd);
+        }
+        else if (lParam == WM_LBUTTONUP)
+        {
+            clickCount++;
+            if (clickCount == 1)
+            {
+                // 더블클릭 판정 대기 (시스템 더블클릭 시간 사용)
+                SetTimer(hwnd, TIMER_DBLCLK, GetDoubleClickTime(), NULL);
+            }
+            else if (clickCount >= 2)
+            {
+                clickCount = 0;
+                KillTimer(hwnd, TIMER_DBLCLK);
+                g_app.config.autoEnglish = !g_app.config.autoEnglish;
+                g_app.config.Save();
+                UpdateTrayIcon();
+            }
+        }
+    }
+    else if (msg == WM_TIMER && wParam == TIMER_DBLCLK)
+    {
+        // 더블클릭 시간 내에 두 번째 클릭 없음 → 싱글클릭으로 처리
+        clickCount = 0;
+        KillTimer(hwnd, TIMER_DBLCLK);
+    }
 
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
@@ -873,6 +907,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
 {
+    // 중복 실행 방지
+    HANDLE hMutex = CreateMutexW(NULL, TRUE, L"AutoIME_SingleInstance");
+    if (GetLastError() == ERROR_ALREADY_EXISTS)
+    {
+        CloseHandle(hMutex);
+        return 0;
+    }
+
     g_app.hInstance = hInstance;
 
     g_app.config.InitPath();
