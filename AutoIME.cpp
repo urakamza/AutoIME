@@ -33,9 +33,11 @@
 #define ID_SET_REMAP_KEY    1003
 #define ID_MANAGE_TARGETS   1004
 #define ID_TOGGLE_STARTUP   1005
-#define ID_EXIT             1006
+#define ID_TOGGLE_TAB       1006
+#define ID_SET_TAB_KEY      1007
+#define ID_EXIT             1008
 
-// 리맵 다이얼로그 컨트롤
+// 리맵 다이얼로그 컨트롤 (Capslock / Tab 공용)
 #define IDC_REMAP_COMBO     2001
 #define IDC_REMAP_EDIT      2002
 #define IDC_REMAP_OK        2003
@@ -77,6 +79,8 @@ struct Config
     bool  autoEnglish  = true;
     bool  remapEnabled = false;
     DWORD remapVKey    = VK_F13;
+    bool  tabEnabled   = false;     // Tab 리맵 활성화 여부
+    DWORD tabVKey      = 0;         // 0 = 비활성화(입력 차단), 그 외 = 리맵 대상 키
     std::vector<std::wstring> targets = { L"clipstudiopaint", L"photoshop" };
     wchar_t path[MAX_PATH] = {};
 
@@ -144,6 +148,10 @@ struct Config
                 remapEnabled = (v == L"1");
             else if (!(v = ParseValue(line, L"RemapKey")).empty())
                 remapVKey = StringToVKey(v);
+            else if (!(v = ParseValue(line, L"TabEnabled")).empty())
+                tabEnabled = (v == L"1");
+            else if (!(v = ParseValue(line, L"TabKey")).empty())
+                tabVKey = (v == L"0") ? 0 : StringToVKey(v);
             else if (!(v = ParseValue(line, L"Target")).empty())
                 targets.push_back(v);
         }
@@ -157,6 +165,8 @@ struct Config
         f << L"AutoEnglish="  << (autoEnglish  ? 1 : 0) << L"\n";
         f << L"RemapEnabled=" << (remapEnabled ? 1 : 0) << L"\n";
         f << L"RemapKey="     << VKeyToString(remapVKey)  << L"\n";
+        f << L"TabEnabled="   << (tabEnabled   ? 1 : 0) << L"\n";
+        f << L"TabKey="       << (tabVKey == 0 ? L"0" : VKeyToString(tabVKey).c_str()) << L"\n";
         for (const auto& t : targets)
             f << L"Target=" << t << L"\n";
     }
@@ -233,6 +243,7 @@ struct AppState
     POINT           lastPos   = { -1, -1 };
 
     bool    dlgOpen         = false;
+    bool    dlgIsTab        = false;  // true = Tab 설정, false = Capslock 설정
     DWORD   dlgCapturedVKey = 0;
     WNDPROC dlgOrigEditProc = NULL;
 } g_app;
@@ -361,10 +372,14 @@ struct DlgBuf
 
 
 // ================================================================
-// 리맵 키 다이얼로그
-// 상단: F13~F24 드롭다운 (ComboBox)
-// 하단: 직접 키 입력 (Edit, 키 캡처)
+// 리맵 키 다이얼로그 (Capslock / Tab 공용)
+// 콤보 맨 위: "비활성화 (차단)"
+// 그 아래: F13~F24
+// Edit: 직접 키 캡처
 // ================================================================
+
+// 콤보 인덱스 0 = 비활성화, 1~ = EXTENDED_KEYS
+static const int COMBO_DISABLE_IDX = 0;
 
 LRESULT CALLBACK EditKeyCapture(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
@@ -375,19 +390,20 @@ LRESULT CALLBACK EditKeyCapture(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (vk == VK_RETURN) { SendMessage(GetParent(hwnd), WM_COMMAND, IDC_REMAP_OK,     0); return 0; }
         if (vk == VK_ESCAPE) { SendMessage(GetParent(hwnd), WM_COMMAND, IDC_REMAP_CANCEL, 0); return 0; }
         if (vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU ||
-            vk == VK_LWIN  || vk == VK_RWIN    || vk == VK_TAB)
+            vk == VK_LWIN  || vk == VK_RWIN)
             return 0;
 
+        // Tab 키 자체도 캡처 가능 (Tab 리맵 다이얼로그에서 다른 키로 설정 가능)
         g_app.dlgCapturedVKey = vk;
 
-        // 콤보박스 선택 동기화
+        // 콤보박스 선택 동기화 (1번 인덱스부터가 EXTENDED_KEYS)
         HWND hCombo = GetDlgItem(GetParent(hwnd), IDC_REMAP_COMBO);
         SendMessage(hCombo, CB_SETCURSEL, (WPARAM)-1, 0);
         for (int i = 0; i < EXTENDED_KEYS_COUNT; i++)
         {
             if (EXTENDED_KEYS[i].vk == vk)
             {
-                SendMessage(hCombo, CB_SETCURSEL, (WPARAM)i, 0);
+                SendMessage(hCombo, CB_SETCURSEL, (WPARAM)(i + 1), 0);
                 break;
             }
         }
@@ -403,22 +419,38 @@ INT_PTR CALLBACK RemapDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam)
     {
     case WM_INITDIALOG:
     {
-        g_app.dlgCapturedVKey = g_app.config.remapVKey;
+        DWORD curVKey = g_app.dlgIsTab ? g_app.config.tabVKey : g_app.config.remapVKey;
+        g_app.dlgCapturedVKey = curVKey;
 
-        // 콤보박스 채우기 + 현재 키 선택
         HWND hCombo = GetDlgItem(hDlg, IDC_REMAP_COMBO);
+        HWND hEdit  = GetDlgItem(hDlg, IDC_REMAP_EDIT);
+
+        // 인덱스 0: 비활성화
+        SendMessage(hCombo, CB_ADDSTRING, 0, (LPARAM)L"\ube44\ud65c\uc131\ud654 (\ucc28\ub2e8)");  // "비활성화 (차단)"
+        if (curVKey == 0)
+        {
+            SendMessage(hCombo, CB_SETCURSEL, COMBO_DISABLE_IDX, 0);
+            SetWindowTextW(hEdit, L"\ube44\ud65c\uc131\ud654");  // "비활성화"
+        }
+
+        // 인덱스 1~: F13~F24
         for (int i = 0; i < EXTENDED_KEYS_COUNT; i++)
         {
             int idx = (int)SendMessage(hCombo, CB_ADDSTRING, 0, (LPARAM)EXTENDED_KEYS[i].label);
-            if (EXTENDED_KEYS[i].vk == g_app.config.remapVKey)
+            if (EXTENDED_KEYS[i].vk == curVKey)
+            {
                 SendMessage(hCombo, CB_SETCURSEL, (WPARAM)idx, 0);
+                SetWindowTextW(hEdit, EXTENDED_KEYS[i].label);
+            }
         }
 
-        // Edit 서브클래싱 (키 직접 캡처)
-        HWND hEdit = GetDlgItem(hDlg, IDC_REMAP_EDIT);
+        // 위에서 선택 못 한 경우 (일반 키 직접 입력)
+        if (curVKey != 0 && SendMessage(hCombo, CB_GETCURSEL, 0, 0) == CB_ERR)
+            SetWindowTextW(hEdit, GetKeyDisplayName(curVKey).c_str());
+
+        // Edit 서브클래싱
         g_app.dlgOrigEditProc = (WNDPROC)SetWindowLongPtr(
             hEdit, GWLP_WNDPROC, (LONG_PTR)EditKeyCapture);
-        SetWindowTextW(hEdit, GetKeyDisplayName(g_app.config.remapVKey).c_str());
 
         SetFocus(hEdit);
         return FALSE;
@@ -427,28 +459,40 @@ INT_PTR CALLBACK RemapDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam)
     case WM_COMMAND:
         switch (LOWORD(wParam))
         {
-        // 콤보 선택 → Edit 동기화
         case IDC_REMAP_COMBO:
             if (HIWORD(wParam) == CBN_SELCHANGE)
             {
                 HWND hCombo = GetDlgItem(hDlg, IDC_REMAP_COMBO);
                 int idx = (int)SendMessage(hCombo, CB_GETCURSEL, 0, 0);
-                if (idx >= 0 && idx < EXTENDED_KEYS_COUNT)
+                HWND hEdit = GetDlgItem(hDlg, IDC_REMAP_EDIT);
+                if (idx == COMBO_DISABLE_IDX)
                 {
-                    g_app.dlgCapturedVKey = EXTENDED_KEYS[idx].vk;
-                    SetWindowTextW(GetDlgItem(hDlg, IDC_REMAP_EDIT), EXTENDED_KEYS[idx].label);
+                    g_app.dlgCapturedVKey = 0;
+                    SetWindowTextW(hEdit, L"\ube44\ud65c\uc131\ud654");  // "비활성화"
+                }
+                else
+                {
+                    int keyIdx = idx - 1;  // 0번이 비활성화이므로 -1
+                    if (keyIdx >= 0 && keyIdx < EXTENDED_KEYS_COUNT)
+                    {
+                        g_app.dlgCapturedVKey = EXTENDED_KEYS[keyIdx].vk;
+                        SetWindowTextW(hEdit, EXTENDED_KEYS[keyIdx].label);
+                    }
                 }
             }
             break;
 
         case IDC_REMAP_OK:
-            if (g_app.dlgCapturedVKey != 0)
-            {
+        {
+            // vk=0이어도 저장 (비활성화)
+            if (g_app.dlgIsTab)
+                g_app.config.tabVKey = g_app.dlgCapturedVKey;
+            else
                 g_app.config.remapVKey = g_app.dlgCapturedVKey;
-                g_app.config.Save();
-            }
+            g_app.config.Save();
             EndDialog(hDlg, IDOK);
             return TRUE;
+        }
 
         case IDC_REMAP_CANCEL:
             EndDialog(hDlg, IDCANCEL);
@@ -463,25 +507,32 @@ INT_PTR CALLBACK RemapDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam)
     return FALSE;
 }
 
-void ShowRemapDialog(HWND hwndParent)
+void ShowRemapDialog(HWND hwndParent, bool isTab)
 {
     if (g_app.dlgOpen) return;
-    g_app.dlgOpen = true;
+    g_app.dlgOpen  = true;
+    g_app.dlgIsTab = isTab;
+
+    // 타이틀: Capslock or Tab
+    const wchar_t* title = isTab
+        ? L"Tab \ud0a4 \uc124\uc815"        // "Tab 키 설정"
+        : L"Capslock \ud0a4 \uc124\uc815";  // "Capslock 키 설정"
 
     DlgBuf b;
     // 컨트롤 6개: STATIC, COMBOBOX, STATIC, EDIT, 확인, 취소
-    b.writeHeader(6, 200, 90, L"Capslock \ud0a4 \uc124\uc815");
+    b.writeHeader(6, 200, 90, title);
 
     b.writeCtrl(WS_CHILD | WS_VISIBLE | SS_LEFT,
                 5, 5, 190, 10, 0, 0x0082,
-                L"F13~F24 \ubaa9\ub85d\uc5d0\uc11c \uc120\ud0dd\ud558\uac70\ub098 \ud0a4\ub97c \ub204\ub974\uc138\uc694:");
+                L"\ubaa9\ub85d\uc5d0\uc11c \uc120\ud0dd\ud558\uac70\ub098 \ud0a4\ub97c \ub204\ub974\uc138\uc694:");
+    // "목록에서 선택하거나 키를 누르세요:"
 
     b.writeCtrl(WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
                 5, 17, 190, 120, IDC_REMAP_COMBO, 0x0085, L"");
 
     b.writeCtrl(WS_CHILD | WS_VISIBLE | SS_LEFT,
                 5, 38, 55, 10, 0, 0x0082,
-                L"\uc9c1\uc811 \uc785\ub825:");
+                L"\uc9c1\uc811 \uc785\ub825:");  // "직접 입력:"
 
     b.writeCtrl(WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_CENTER | ES_READONLY,
                 63, 36, 132, 14, IDC_REMAP_EDIT, 0x0081, L"");
@@ -677,20 +728,37 @@ LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
     if (nCode < 0) return CallNextHookEx(g_app.kbdHook, nCode, wParam, lParam);
 
     auto* kb = (KBDLLHOOKSTRUCT*)lParam;
+    bool  isDown = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
+    bool  isUp   = (wParam == WM_KEYUP   || wParam == WM_SYSKEYUP);
 
-    if (kb->vkCode == VK_CAPITAL &&
-        (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN ||
-         wParam == WM_KEYUP   || wParam == WM_SYSKEYUP))
+    if ((isDown || isUp) && g_app.watcher.IsTarget(g_app.config.targets))
     {
-        if (g_app.config.remapEnabled && g_app.watcher.IsTarget(g_app.config.targets))
+        // Capslock 리맵
+        if (kb->vkCode == VK_CAPITAL && g_app.config.remapEnabled)
         {
-            bool up        = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP);
+            if (g_app.config.remapVKey == 0)
+                return 1;  // 비활성화: 그냥 차단
+
             INPUT inp      = {};
             inp.type       = INPUT_KEYBOARD;
             inp.ki.wVk     = (WORD)g_app.config.remapVKey;
-            inp.ki.dwFlags = up ? KEYEVENTF_KEYUP : 0;
+            inp.ki.dwFlags = isUp ? KEYEVENTF_KEYUP : 0;
             SendInput(1, &inp, sizeof(INPUT));
-            return 1;  // 원래 Capslock 이벤트 차단
+            return 1;
+        }
+
+        // Tab 리맵
+        if (kb->vkCode == VK_TAB && g_app.config.tabEnabled)
+        {
+            if (g_app.config.tabVKey == 0)
+                return 1;  // 비활성화: 그냥 차단
+
+            INPUT inp      = {};
+            inp.type       = INPUT_KEYBOARD;
+            inp.ki.wVk     = (WORD)g_app.config.tabVKey;
+            inp.ki.dwFlags = isUp ? KEYEVENTF_KEYUP : 0;
+            SendInput(1, &inp, sizeof(INPUT));
+            return 1;
         }
     }
 
@@ -768,31 +836,41 @@ static void Startup_Unregister()
 //
 // ✓ 자동 영어 전환
 // ✓ Capslock 리맵
+// ✓ Tab 리맵
 // ─────────────────
 //   설정 ▶
 //     Capslock → F13 설정...
+//     Tab → F14 설정...
 //     대상 프로그램 관리...
+//     ─────────────────
+//     시작 프로그램 등록
 // ─────────────────
 // 종료
 // ================================================================
 
 void ShowTrayMenu(HWND hwnd)
 {
-    wchar_t remapLabel[64];
+    wchar_t remapLabel[64], tabLabel[64];
     swprintf_s(remapLabel, L"Capslock \u2192 %s \uc124\uc815...",
-               GetKeyDisplayName(g_app.config.remapVKey).c_str());
+               g_app.config.remapVKey == 0
+                   ? L"\ube44\ud65c\uc131\ud654"
+                   : GetKeyDisplayName(g_app.config.remapVKey).c_str());
+    swprintf_s(tabLabel, L"Tab \u2192 %s \uc124\uc815...",
+               g_app.config.tabVKey == 0
+                   ? L"\ube44\ud65c\uc131\ud654"
+                   : GetKeyDisplayName(g_app.config.tabVKey).c_str());
 
     // 설정 서브메뉴
     bool startupOn = Startup_IsRegistered();
     HMENU hSub = CreatePopupMenu();
     InsertMenuW(hSub, -1, MF_BYPOSITION, ID_SET_REMAP_KEY, remapLabel);
+    InsertMenuW(hSub, -1, MF_BYPOSITION, ID_SET_TAB_KEY,   tabLabel);
     InsertMenuW(hSub, -1, MF_BYPOSITION, ID_MANAGE_TARGETS,
         L"\ub300\uc0c1 \ud504\ub85c\uadf8\ub7a8 \uad00\ub9ac...");
     InsertMenuW(hSub, -1, MF_SEPARATOR, 0, NULL);
     InsertMenuW(hSub, -1,
         MF_BYPOSITION | (startupOn ? MF_CHECKED : 0),
-        ID_TOGGLE_STARTUP,
-        L"\uc2dc\uc791 \ud504\ub85c\uadf8\ub7a8 \ub4f1\ub85d");    // "시작 프로그램 등록"
+        ID_TOGGLE_STARTUP, L"\uc2dc\uc791 \ud504\ub85c\uadf8\ub7a8 \ub4f1\ub85d");
 
     // 메인 메뉴
     HMENU hMenu = CreatePopupMenu();
@@ -804,6 +882,10 @@ void ShowTrayMenu(HWND hwnd)
     InsertMenuW(hMenu, -1,
         MF_BYPOSITION | (g_app.config.remapEnabled ? MF_CHECKED : 0),
         ID_TOGGLE_REMAP, L"Capslock \ub9ac\ub9f5");
+
+    InsertMenuW(hMenu, -1,
+        MF_BYPOSITION | (g_app.config.tabEnabled ? MF_CHECKED : 0),
+        ID_TOGGLE_TAB, L"Tab \ub9ac\ub9f5");
 
     InsertMenuW(hMenu, -1, MF_SEPARATOR, 0, NULL);
 
@@ -819,7 +901,7 @@ void ShowTrayMenu(HWND hwnd)
     SetForegroundWindow(hwnd);
 
     int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD, pt.x, pt.y, 0, hwnd, NULL);
-    DestroyMenu(hMenu);  // hSub 도 함께 해제됨
+    DestroyMenu(hMenu);
 
     switch (cmd)
     {
@@ -834,8 +916,17 @@ void ShowTrayMenu(HWND hwnd)
         g_app.config.Save();
         break;
 
+    case ID_TOGGLE_TAB:
+        g_app.config.tabEnabled = !g_app.config.tabEnabled;
+        g_app.config.Save();
+        break;
+
     case ID_SET_REMAP_KEY:
-        ShowRemapDialog(hwnd);
+        ShowRemapDialog(hwnd, false);
+        break;
+
+    case ID_SET_TAB_KEY:
+        ShowRemapDialog(hwnd, true);
         break;
 
     case ID_MANAGE_TARGETS:
