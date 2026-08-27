@@ -2,6 +2,7 @@
 *.exe
 *.obj
 *.res
+*.bak
 
 # 설정 파일 (사용자마다 다름)
 config.ini
